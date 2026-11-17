@@ -3,7 +3,7 @@
 promo_bot — три Telethon-аккаунта, плановые посты в группы + автоответ в личке.
 
 Аккаунт 1 пишет тексты из "first", аккаунты 2 и 3 — из "second" (texts.json).
-Группы берутся из groups.txt (ссылки / @username, ID не нужны).
+Группы: если groups.txt пуст — все группы, где состоят аккаунты (авто); иначе только из groups.txt.
 Отчёт админу уходит ТОЛЬКО с одного аккаунта (REPORT_ACCOUNT), с общими данными.
 
 Правила отправки (все настраиваются через переменные окружения, см. README.md):
@@ -258,6 +258,8 @@ class Bot:
         self.version = 0                       # растёт при любом изменении (для бэкапа)
         self.alerts: list[str] = []            # срочные сообщения админу
         self.stop = False
+        self.auto_groups = not groups           # groups.txt пуст → берём группы из аккаунтов
+        self.titles: dict[str, str] = {}
         self._admin_ids: set = set()
         self._now = None                       # для тестов
 
@@ -444,9 +446,23 @@ class Bot:
 
     # ───────── членство в группах (без ResolveUsername и без вступления) ─────────
 
+    @staticmethod
+    def _can_write(ent) -> bool:
+        """Группа, куда аккаунт реально может писать (не канал, не вышел, не кикнут, нет запрета)."""
+        if getattr(ent, "broadcast", False) or getattr(ent, "left", False) or getattr(ent, "kicked", False):
+            return False
+        if getattr(ent, "deactivated", False):
+            return False
+        if getattr(ent, "creator", False) or getattr(ent, "admin_rights", None):
+            return True
+        rights = getattr(ent, "default_banned_rights", None)
+        return not (rights and getattr(rights, "send_messages", False))
+
     async def refresh_members(self):
         from telethon import functions, types, utils
-        members: dict[str, set] = {r.key: set() for r in self.groups}
+        scans = {}          # {акк: (by_user, by_id)}
+        found = {}          # авто-режим: {ключ: (pid, название)}
+        failed = set()
         for acc, client in self.clients.items():
             if acc in self.dead:
                 continue
@@ -463,11 +479,30 @@ class Bot:
                     for n in names:
                         if n:
                             by_user[n.lower()] = pid
+                    if self.auto_groups and self._can_write(ent):
+                        found.setdefault(str(pid), (pid, getattr(ent, "title", None) or str(pid)))
+                scans[acc] = (by_user, by_id)
             except Exception as e:  # noqa: BLE001
                 log.warning("acc%s: не удалось получить диалоги: %s", acc, e)
+                failed.add(acc)
+
+        if self.auto_groups:
+            # Список групп = все группы, где состоят аккаунты (groups.txt не нужен)
+            self.titles = {k: t for k, (_, t) in found.items()}
+            self.groups = [GroupRef(k, "id", pid) for k, (pid, _) in found.items()]
+            for acc in failed:      # прежнее членство не теряем, если Telegram не ответил
                 for k in self.chat_ids.get(acc, {}):
-                    members.setdefault(k, set()).add(acc)   # оставляем прежнее членство
+                    if k not in found:
+                        self.groups.append(GroupRef(k, "id", int(k)))
+
+        members: dict[str, set] = {r.key: set() for r in self.groups}
+        for acc in failed:
+            for k in self.chat_ids.get(acc, {}):
+                members.setdefault(k, set()).add(acc)   # оставляем прежнее членство
+        for acc, client in self.clients.items():
+            if acc not in scans:
                 continue
+            by_user, by_id = scans[acc]
             ids, seen_pid = {}, {}
             for ref in self.groups:
                 pid = None
@@ -492,6 +527,10 @@ class Bot:
                     members[ref.key].add(acc)
             self.chat_ids[acc] = ids
         self.members = members
+
+    def label(self, key: str) -> str:
+        t = self.titles.get(key)
+        return f"{t} ({key})" if t else key
 
     # ───────── личные сообщения ─────────
 
@@ -575,7 +614,7 @@ class Bot:
                     f"каждые {r['cooldown']:g} ч" if "cooldown" in r else "",
                     "окна " + ",".join(f"{a}-{b}" for a, b in r["windows"]) if "windows" in r else "",
                     "только акк " + ",".join(map(str, sorted(r["acc"]))) if "acc" in r else ""]))
-            rows.append(f"{ref.key} · акк: {accs} · пост: {when}{off}{extra}")
+            rows.append(f"{self.label(ref.key)} · акк: {accs} · пост: {when}{off}{extra}")
         return "\n".join(rows)[:3900] or "Групп нет"
 
     def report_text(self, since: datetime | None, title: str = "📊 Отчёт") -> str:
@@ -626,9 +665,9 @@ class Bot:
                  f"групп в списке: {len(self.groups)}, доступных: {len(self.groups) - len(no_acc)}"]
         for acc in sorted(self.clients):
             n = sum(1 for m in self.members.values() if acc in m)
-            lines.append(f"Акк.{acc}: состоит в {n} группах из списка" + (f" · ❌ {self.dead[acc]}" if acc in self.dead else ""))
+            lines.append(f"Акк.{acc}: состоит в {n} группах" + ("" if self.auto_groups else " из списка") + (f" · ❌ {self.dead[acc]}" if acc in self.dead else ""))
         if no_acc:
-            lines.append("Ни один аккаунт не состоит в: " + ", ".join(no_acc[:25]) + (" …" if len(no_acc) > 25 else ""))
+            lines.append("Ни один аккаунт не состоит в: " + ", ".join(self.label(k) for k in no_acc[:25]) + (" …" if len(no_acc) > 25 else ""))
         return "\n".join(lines)
 
     async def send_report(self, text: str):
@@ -766,7 +805,7 @@ async def main():
     if not sessions:
         raise SystemExit("Нет SESSION_STRING_1..3")
     if not groups:
-        raise SystemExit("groups.txt пуст — добавьте группы")
+        log.info("groups.txt пуст — беру все группы, где состоят аккаунты")
     api_id, api_hash = int(os.environ["API_ID"]), os.environ["API_HASH"]
 
     clients, dead = {}, {}
