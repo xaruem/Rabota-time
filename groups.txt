@@ -1,0 +1,11 @@
+# Одна группа в строке. ID не нужны: @username, t.me/name или t.me/+инвайт.
+# После ссылки через | можно задать СВОЁ расписание группы (всё необязательно):
+#   cooldown=6        — писать в группу не чаще раза в 6 часов (по умолчанию 24)
+#   window=9-12,18-22 — только в эти часы суток (по умолчанию общее окно 9-22)
+#   acc=2,3           — только эти аккаунты (по умолчанию любой, кто в группе)
+#
+# @obychnaya_gruppa
+# https://t.me/bolshaya_gruppa | cooldown=8 | window=9-12,18-22
+# t.me/redkaya_gruppa | cooldown=72
+# @tolko_dlya_raboty | acc=2,3 | window=10-14
+# t.me/+AbCdEfGhIjK123 | acc=1
