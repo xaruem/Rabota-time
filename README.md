@@ -26,12 +26,17 @@
 - Ошибки: FloodWait/PeerFlood → пауза аккаунта; запрет писать/бан → группа отключается для аккаунта; slowmode → отложено.
 - Автоответ: первому написавшему в лс (раз в 7 дней на человека, отдельно на каждый аккаунт) — один из 3 вариантов текста из `dm_greeting`.
 - Отчёт админу `@mannapov_ulugbek` — только с аккаунта `REPORT_ACCOUNT` (1), общие данные по всем, каждые 3 ч.
-  Админ может написать любому аккаунту: `/status`, `/groups`, `/pause`, `/resume`, `/open`.
+  Админ может написать любому аккаунту: `/status`, `/groups`, `/fails`, `/pause`, `/resume`, `/open`.
+- **Надёжность отправки:**
+  - при сбое связи бот повторяет отправку (до `SEND_RETRIES`=3 раза) и перед повтором проверяет, не ушло ли сообщение уже — дублей нет;
+  - через `VERIFY_DELAY_SEC` (20 с) после отправки бот читает сообщение из группы и убеждается, что оно на месте, ещё раз — через `LATE_VERIFY_MIN` (15 мин): не удалил ли его админ/антиспам-бот;
+  - если не отправилось — админу приходит причина простыми словами и «Что делать» (один и тот же сигнал — не чаще раза в 6 ч); `/fails` показывает все нерешённые случаи;
+  - отключённые группы (нет прав, бан) бот сам проверяет заново через `OFF_RETRY_HOURS` (12 ч, потом ×2, ×4, макс ×8); сетевые сбои группу не отключают.
 - Состояние хранится в `state.json` и бэкапится в «Избранное» аккаунта-отчётника (переживает редеплой).
 
 ## Настройки (необязательно)
 `BOT_TZ`, `WINDOW_START_HOUR/END_HOUR`, `POST_GAP_MIN_MINUTES/MAX_MINUTES`, `GLOBAL_GAP_SEC`,
-`GROUP_COOLDOWN_HOURS`, `DAILY_LIMIT_PER_ACCOUNT`, `REPORT_EVERY_HOURS`, `REPORT_ACCOUNT`, `ADMIN_USERNAME`, `GREET_AGAIN_DAYS`.
+`GROUP_COOLDOWN_HOURS`, `DAILY_LIMIT_PER_ACCOUNT`, `REPORT_EVERY_HOURS`, `REPORT_ACCOUNT`, `ADMIN_USERNAME`, `GREET_AGAIN_DAYS`, `SEND_RETRIES`, `RETRY_BACKOFF_SEC`, `VERIFY_DELAY_SEC`, `LATE_VERIFY_MIN`, `OFF_RETRY_HOURS`.
 
 ## Тесты
-`pip install pytest && pytest -q` (23 теста, в т.ч. симуляция 3 суток на виртуальном времени).
+`pip install pytest && pytest -q` (32 теста, в т.ч. симуляция 3 суток на виртуальном времени).

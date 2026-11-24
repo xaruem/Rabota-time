@@ -54,6 +54,11 @@ class Cfg:
     report_account: int = 1
     admin: str = "@mannapov_ulugbek"
     greet_again_days: int = 7
+    send_retries: int = 3          # попыток отправки при сетевых сбоях
+    retry_backoff_sec: float = 5.0 # пауза между попытками (×номер попытки)
+    verify_delay_sec: float = 20.0 # через сколько секунд проверить, что пост реально появился в группе
+    late_verify_min: float = 15.0  # повторная проверка: не удалил ли пост админ/антиспам-бот
+    off_retry_hours: float = 12.0  # через сколько часов снова пробовать отключённую группу (дальше ×2, макс ×8)
     state_path: str = "state.json"
     groups_path: str = "groups.txt"
     texts_path: str = "texts.json"
@@ -73,6 +78,11 @@ class Cfg:
             report_account=int(_env("REPORT_ACCOUNT", str(cls.report_account))),
             admin=_env("ADMIN_USERNAME", cls.admin),
             greet_again_days=int(_env("GREET_AGAIN_DAYS", str(cls.greet_again_days))),
+            send_retries=int(_env("SEND_RETRIES", str(cls.send_retries))),
+            retry_backoff_sec=float(_env("RETRY_BACKOFF_SEC", str(cls.retry_backoff_sec))),
+            verify_delay_sec=float(_env("VERIFY_DELAY_SEC", str(cls.verify_delay_sec))),
+            late_verify_min=float(_env("LATE_VERIFY_MIN", str(cls.late_verify_min))),
+            off_retry_hours=float(_env("OFF_RETRY_HOURS", str(cls.off_retry_hours))),
             state_path=_env("STATE_PATH", cls.state_path),
             groups_path=_env("GROUPS_FILE", cls.groups_path),
             texts_path=_env("TEXTS_FILE", cls.texts_path),
@@ -229,6 +239,54 @@ def pick_group(now: datetime, acc: int, members: dict, groups_state: dict,
     return cands[0][3]
 
 
+def explain_error(e: BaseException) -> tuple[str, str, str]:
+    """Ошибка отправки -> (вид, причина простыми словами, что делать).
+
+    Виды: flood | slow | peerflood | dead | group_off | transient | bad_text | no_chat | unknown.
+    """
+    from telethon import errors as E
+    n = type(e).__name__
+    if isinstance(e, E.FloodWaitError):
+        s = int(getattr(e, "seconds", 60))
+        return "flood", f"Telegram просит подождать {s} с: слишком частая отправка", \
+            "бот сам подождёт; если повторяется — уменьшите DAILY_LIMIT_PER_ACCOUNT или увеличьте паузы"
+    if isinstance(e, E.SlowModeWaitError):
+        s = int(getattr(e, "seconds", 600))
+        return "slow", f"В группе медленный режим: следующее сообщение можно через {s} с", \
+            "ничего — бот отложит пост и повторит позже"
+    if isinstance(e, E.PeerFloodError):
+        return "peerflood", "Telegram ограничил аккаунт (жалобы на спам / слишком много сообщений)", \
+            "аккаунт на паузе 24 ч; проверьте его через @SpamBot и не повышайте частоту постов"
+    if isinstance(e, E.AuthKeyDuplicatedError):
+        return "dead", "Одну и ту же сессию используют сразу с двух мест (например, два запущенных деплоя)", \
+            "оставьте ОДИН запущенный экземпляр и пересоздайте SESSION_STRING через auth.py"
+    if isinstance(e, (E.AuthKeyUnregisteredError, E.SessionRevokedError)):
+        return "dead", "Сессия аккаунта отозвана (вышли из аккаунта на всех устройствах)", \
+            "создайте новую SESSION_STRING через auth.py и обновите переменную"
+    if isinstance(e, (E.UserDeactivatedError, E.UserDeactivatedBanError)):
+        return "dead", "Аккаунт удалён или заблокирован Telegram", "нужен другой аккаунт и новая SESSION_STRING"
+    if isinstance(e, E.ChatWriteForbiddenError):
+        return "group_off", "В группе нельзя писать этому аккаунту (только админы / ограничен / закрыто)", \
+            "попросите админа выдать право писать или уберите группу; бот проверит снова позже"
+    if isinstance(e, (E.UserBannedInChannelError, E.ChatRestrictedError, E.UserRestrictedError)):
+        return "group_off", "Аккаунт забанен или ограничен в этой группе", \
+            "убрать группу для этого аккаунта или договориться с админом; бот проверит снова позже"
+    if isinstance(e, E.ChatAdminRequiredError):
+        return "group_off", "В этой группе писать могут только админы", "уберите группу из списка"
+    if isinstance(e, (E.ChannelPrivateError, E.UserNotParticipantError)):
+        return "group_off", "Аккаунт больше не состоит в группе (вышел / удалён) или группа стала приватной", \
+            "вступите в группу снова вручную с этого аккаунта"
+    if isinstance(e, (E.PeerIdInvalidError, E.ChannelInvalidError, E.ChatIdInvalidError)):
+        return "group_off", "Группа не найдена (удалена, перенесена или сменила адрес)", \
+            "обновите ссылку в groups.txt"
+    if isinstance(e, (E.MessageTooLongError, E.MessageEmptyError)):
+        return "bad_text", "Telegram не принял сам текст (пустой или слишком длинный)", "проверьте texts.json"
+    if isinstance(e, (E.ServerError, E.TimedOutError, ConnectionError, TimeoutError, asyncio.TimeoutError,
+                      OSError, E.InvalidBufferError)):
+        return "transient", f"Временный сбой связи с Telegram ({n})", "бот повторит сам; если часто — проверьте сеть/хостинг"
+    return "unknown", f"Неожиданная ошибка: {n}: {str(e)[:100]}", "посмотрите логи Railway; бот отключит группу после 3 таких ошибок подряд"
+
+
 def default_state() -> dict:
     return {"groups": {}, "accounts": {}, "greeted": {}, "events": [], "bags": {},
             "global_until": None, "paused": False, "report_since": None,
@@ -262,6 +320,9 @@ class Bot:
         self.titles: dict[str, str] = {}
         self._admin_ids: set = set()
         self._now = None                       # для тестов
+        self.sleep = asyncio.sleep             # подменяется в тестах
+        self.pending: list[dict] = []          # посты, которые надо перепроверить позже
+        self._alert_seen: dict = {}            # антифлуд для срочных сообщений админу
 
     # --- время
     def now(self) -> datetime:
@@ -292,14 +353,27 @@ class Bot:
     def group_state(self, key: str) -> dict:
         return self.state["groups"].setdefault(key, {})
 
-    def event(self, kind: str, acc: int | None = None, group: str | None = None, detail: str = ""):
+    ALERT_KINDS = ("acc_pause", "acc_dead", "group_off", "post_deleted", "post_fail")
+
+    def event(self, kind: str, acc: int | None = None, group: str | None = None, detail: str = "",
+              fix: str = ""):
         ev = {"ts": iso(self.now()), "kind": kind, "acc": acc, "group": group, "detail": detail}
+        if fix:
+            ev["fix"] = fix
         evs = self.state["events"]
         evs.append(ev)
         if len(evs) > 1500:
             del evs[:-1500]
-        if kind in ("acc_pause", "acc_dead"):
-            self.alerts.append(f"⚠️ Акк.{acc}: {detail}" + (f" (группа {group})" if group else ""))
+        if kind in self.ALERT_KINDS:
+            now = self.now()
+            akey = (kind, acc, group)
+            seen = self._alert_seen.get(akey)
+            if not seen or now - seen > timedelta(hours=6):      # одно и то же — не чаще раза в 6 ч
+                self._alert_seen[akey] = now
+                text = f"⚠️ Акк.{acc}: {detail}" + (f" (группа {self.label(group)})" if group else "")
+                if fix:
+                    text += f"\n   ➜ Что делать: {fix}"
+                self.alerts.append(text)
         self.touch()
 
     # --- тексты
@@ -361,6 +435,7 @@ class Bot:
         now = self.now()
         if self.state.get("paused"):
             return 60
+        self.reopen_due(now)
         a = self.acc_state(acc)
         if not a.get("next_at"):   # первый запуск: разнести аккаунты по времени
             a["next_at"] = iso(now + timedelta(minutes=self.rng.uniform(1, 8) * acc))
@@ -390,8 +465,82 @@ class Bot:
             await asyncio.sleep(delay)
 
     # --- отправка
+
+    def mark_off(self, acc: int, key: str, reason: str):
+        g = self.group_state(key)
+        g.setdefault("off", {})[str(acc)] = reason
+        g.setdefault("off_at", {})[str(acc)] = iso(self.now())
+        n = g.setdefault("off_n", {})
+        n[str(acc)] = n.get(str(acc), 0) + 1
+
+    def reopen_due(self, now: datetime):
+        """Перепроверка отключённых групп: права и баны меняются, поэтому через
+        off_retry_hours (потом ×2, ×4, макс ×8) группа снова получает шанс."""
+        for key, g in self.state["groups"].items():
+            off = g.get("off") or {}
+            for acc_s in list(off):
+                at_map = g.setdefault("off_at", {})
+                at = parse_iso(at_map.get(acc_s))
+                if not at:                       # старое состояние без отметки времени
+                    at_map[acc_s] = iso(now)
+                    continue
+                n = max(1, g.get("off_n", {}).get(acc_s, 1))
+                wait = timedelta(hours=self.cfg.off_retry_hours * min(2 ** (n - 1), 8))
+                if now - at >= wait:
+                    del off[acc_s]
+                    self.event("group_reopen", int(acc_s), key, "группа снова включена для повторной проверки")
+
+    def register_fail(self, acc: int, key: str | None, kind: str, reason: str, fix: str):
+        """Запомнить последнюю причину неудачи по группе — попадёт в отчёт и в /fails."""
+        if key:
+            self.group_state(key)["last_fail"] = {"ts": iso(self.now()), "acc": acc, "kind": kind,
+                                                  "reason": reason, "fix": fix}
+
+    async def find_recent_own(self, client, chat, text: str):
+        """Есть ли в группе наше свежее сообщение с этим текстом (защита от дубля после сбоя связи)."""
+        try:
+            async for m in client.iter_messages(chat, limit=10):
+                if getattr(m, "out", False) and (getattr(m, "message", "") or "").strip() == text.strip():
+                    if abs((self.now() - m.date).total_seconds()) < 180:
+                        return m
+        except Exception as e:  # noqa: BLE001
+            log.info("не удалось проверить дубль: %s", e)
+        return None
+
+    async def message_exists(self, acc: int, chat, msg_id: int):
+        """True — сообщение на месте, False — его нет (удалено), None — проверить не удалось."""
+        try:
+            m = await self.clients[acc].get_messages(chat, ids=msg_id)
+        except Exception as e:  # noqa: BLE001
+            log.info("акк.%s: проверка поста не удалась: %s", acc, e)
+            return None
+        return bool(m)
+
+    def post_deleted(self, acc: int, key: str, when: str):
+        g = self.group_state(key)
+        g["deleted"] = g.get("deleted", 0) + 1
+        reason = f"Пост был отправлен, но {when} пропал: его удалил админ или антиспам-бот группы"
+        fix = "в этой группе реклама, скорее всего, запрещена — согласуйте с админом или уберите группу"
+        self.register_fail(acc, key, "deleted", reason, fix)
+        self.event("post_deleted", acc, key, reason, fix)
+        if g["deleted"] >= 2:
+            self.mark_off(acc, key, "посты удаляются модерацией")
+            self.event("group_off", acc, key, "посты удаляются модерацией (2 раза подряд)", fix)
+
+    async def process_pending(self):
+        """Повторная проверка постов через late_verify_min минут."""
+        now = self.now()
+        due = [p for p in self.pending if p["due"] <= now]
+        self.pending = [p for p in self.pending if p["due"] > now]
+        for p in due:
+            ok = await self.message_exists(p["acc"], p["chat"], p["msg_id"])
+            if ok is False:
+                self.post_deleted(p["acc"], p["key"], f"через {int(self.cfg.late_verify_min)} мин")
+            elif ok:
+                self.group_state(p["key"])["deleted"] = 0
+                self.touch()
+
     async def send_one(self, acc: int, key: str):
-        from telethon import errors as E
         now = self.now()
         a = self.acc_state(acc)
         g = self.group_state(key)
@@ -400,49 +549,144 @@ class Bot:
             a["next_at"] = iso(now + timedelta(hours=1))
             return
         pool, idx, text = picked
-        chat = self.chat_ids[acc][key]
+        chat = self.chat_ids.get(acc, {}).get(key)
 
         def short_retry():
             a["next_at"] = iso(self.now() + timedelta(minutes=self.rng.uniform(2, 5)))
 
-        try:
-            await self.clients[acc].send_message(chat, text, link_preview=False)
-        except E.FloodWaitError as e:
-            secs = int(getattr(e, "seconds", 60))
-            a["paused_until"] = iso(now + timedelta(seconds=secs + 30))
-            self.event("flood", acc, key, f"FloodWait {secs}s")
-        except E.SlowModeWaitError as e:
-            secs = int(getattr(e, "seconds", 600))
-            g["slow_until"] = iso(now + timedelta(seconds=secs + 30))
-            self.event("slow", acc, key, f"SlowMode {secs}s")
+        if chat is None:
+            reason = "Аккаунт не нашёл эту группу среди своих диалогов (вышел, удалён или список не загрузился)"
+            fix = "проверьте, что аккаунт в группе; список групп обновляется каждые 6 ч"
+            self.mark_off(acc, key, "группа не найдена в диалогах")
+            self.register_fail(acc, key, "no_chat", reason, fix)
+            self.event("group_off", acc, key, reason, fix)
             short_retry()
-        except E.PeerFloodError:
-            a["paused_until"] = iso(now + timedelta(hours=24))
-            self.event("acc_pause", acc, key, "PeerFlood: аккаунт на паузе 24 ч")
-        except (E.AuthKeyUnregisteredError, E.UserDeactivatedError,
-                E.UserDeactivatedBanError, E.SessionRevokedError) as e:
-            self.dead[acc] = type(e).__name__
-            self.event("acc_dead", acc, None, type(e).__name__)
-        except (E.ChatWriteForbiddenError, E.UserBannedInChannelError, E.ChatAdminRequiredError,
-                E.ChannelPrivateError, E.UserNotParticipantError, E.ChatRestrictedError) as e:
-            g.setdefault("off", {})[str(acc)] = type(e).__name__
-            self.event("group_off", acc, key, type(e).__name__)
-            short_retry()
-        except Exception as e:  # noqa: BLE001
-            g["fails"] = g.get("fails", 0) + 1
-            self.event("post_err", acc, key, f"{type(e).__name__}: {e}"[:160])
-            if g["fails"] >= 3:
-                g.setdefault("off", {})[str(acc)] = f"3 ошибки подряд: {type(e).__name__}"
-                self.event("group_off", acc, key, f"3 ошибки подряд: {type(e).__name__}")
-            short_retry()
+            self.touch()
+            return
+
+        client = self.clients[acc]
+        msg, err = None, None
+        for attempt in range(1, max(1, self.cfg.send_retries) + 1):
+            try:
+                if not client.is_connected():
+                    await client.connect()
+                msg = await client.send_message(chat, text, link_preview=False)
+                err = None
+                break
+            except Exception as e:  # noqa: BLE001
+                err = e
+                if explain_error(e)[0] != "transient" or attempt >= self.cfg.send_retries:
+                    break
+                self.event("retry", acc, key, f"попытка {attempt}: {type(e).__name__}")
+                await self.sleep(self.cfg.retry_backoff_sec * attempt)
+                dup = await self.find_recent_own(client, chat, text)   # вдруг сообщение всё же ушло
+                if dup is not None:
+                    msg, err = dup, None
+                    break
+
+        if err is not None:
+            await self._handle_failure(acc, key, err, now, short_retry)
+            self.touch()
+            return
+
+        # ---- отправлено: перепроверяем, что пост реально лежит в группе
+        verified = None
+        msg_id = getattr(msg, "id", None)
+        if msg_id:
+            await self.sleep(self.cfg.verify_delay_sec)
+            verified = await self.message_exists(acc, chat, msg_id)
+        g.update(last_post=iso(now), last_text=idx, fails=0, posts=g.get("posts", 0) + 1, last_acc=acc)
+        a["sent_today"] = a.get("sent_today", 0) + 1
+        a["net_fails"] = 0
+        a["next_at"] = iso(now + timedelta(minutes=self.rng.uniform(self.cfg.gap_min, self.cfg.gap_max)))
+        self.commit_text(pool, idx)
+        if verified is False:
+            self.post_deleted(acc, key, "сразу после отправки")
         else:
-            g.update(last_post=iso(now), last_text=idx, fails=0, posts=g.get("posts", 0) + 1,
-                     last_acc=acc)
-            a["sent_today"] = a.get("sent_today", 0) + 1
-            a["next_at"] = iso(now + timedelta(minutes=self.rng.uniform(self.cfg.gap_min, self.cfg.gap_max)))
-            self.commit_text(pool, idx)
-            self.event("post_ok", acc, key)
+            if verified:
+                g["deleted"] = 0
+                g["verified_at"] = iso(self.now())
+                g.pop("last_fail", None)
+                self.pending.append({"acc": acc, "key": key, "chat": chat, "msg_id": msg_id,
+                                     "due": now + timedelta(minutes=self.cfg.late_verify_min)})
+            self.event("post_ok", acc, key, "проверено" if verified else "отправлено, проверить не удалось")
         self.touch()
+
+    async def _handle_failure(self, acc, key, err, now, short_retry):
+        a = self.acc_state(acc)
+        g = self.group_state(key)
+        kind, reason, fix = explain_error(err)
+        self.register_fail(acc, key, kind, reason, fix)
+        if kind == "flood":
+            secs = int(getattr(err, "seconds", 60))
+            a["paused_until"] = iso(now + timedelta(seconds=secs + 30))
+            self.event("flood", acc, key, f"FloodWait {secs}s", fix)
+        elif kind == "slow":
+            secs = int(getattr(err, "seconds", 600))
+            g["slow_until"] = iso(now + timedelta(seconds=secs + 30))
+            self.event("slow", acc, key, f"SlowMode {secs}s", fix)
+            short_retry()
+        elif kind == "peerflood":
+            a["paused_until"] = iso(now + timedelta(hours=24))
+            self.event("acc_pause", acc, key, "PeerFlood: аккаунт на паузе 24 ч — " + reason, fix)
+        elif kind == "dead":
+            self.dead[acc] = type(err).__name__
+            self.event("acc_dead", acc, None, f"{type(err).__name__}: {reason}", fix)
+        elif kind == "group_off":
+            self.mark_off(acc, key, type(err).__name__)
+            self.event("group_off", acc, key, f"{type(err).__name__}: {reason}", fix)
+            short_retry()
+        elif kind == "transient":
+            a["net_fails"] = a.get("net_fails", 0) + 1       # группа ни при чём — её не отключаем
+            self.event("post_err", acc, key, f"{type(err).__name__}: {reason}", fix)
+            if a["net_fails"] >= 3:
+                self.event("post_fail", acc, key, f"3 неудачи подряд из-за связи с Telegram ({type(err).__name__})", fix)
+            short_retry()
+        elif kind == "bad_text":
+            self.event("post_fail", acc, key, reason, fix)
+            a["next_at"] = iso(now + timedelta(hours=1))
+        else:
+            g["fails"] = g.get("fails", 0) + 1
+            self.event("post_err", acc, key, f"{type(err).__name__}: {err}"[:160], fix)
+            if g["fails"] >= 3:
+                self.mark_off(acc, key, f"3 ошибки подряд: {type(err).__name__}")
+                self.event("group_off", acc, key, f"3 ошибки подряд: {type(err).__name__}", fix)
+            short_retry()
+
+    # --- почему группа без поста
+    def why_not(self, key: str, now: datetime) -> str:
+        g = self.state["groups"].get(key, {})
+        accs = self.members.get(key, set())
+        if not accs:
+            return "ни один аккаунт не состоит в группе"
+        off = g.get("off", {})
+        if all(str(a) in off for a in accs):
+            return "отключена для всех аккаунтов: " + ", ".join(sorted(set(off.values())))[:80]
+        slow = parse_iso(g.get("slow_until"))
+        if slow and slow > now:
+            return f"медленный режим до {slow.astimezone(self.tz).strftime('%H:%M')}"
+        lf = g.get("last_fail")
+        if lf and (not g.get("last_post") or (parse_iso(lf["ts"]) or now) > (parse_iso(g["last_post"]) or now)):
+            return lf["reason"]
+        return "в очереди (общие паузы, окно времени или дневной лимит)"
+
+    def undelivered_text(self, limit: int = 10) -> str:
+        """Группы, где последняя попытка не удалась и после неё поста не было."""
+        now = self.now()
+        rows = []
+        for ref in self.groups:
+            g = self.state["groups"].get(ref.key, {})
+            lf = g.get("last_fail")
+            if not lf:
+                continue
+            fail_ts, post_ts = parse_iso(lf["ts"]), parse_iso(g.get("last_post"))
+            if post_ts and fail_ts and post_ts > fail_ts:
+                continue
+            rows.append(f"• {self.label(ref.key)} · акк.{lf['acc']}\n   Почему: {lf['reason']}\n   Что делать: {lf['fix']}")
+        if not rows:
+            return "✅ Нерешённых проблем с отправкой нет"
+        more = f"\n…и ещё {len(rows) - limit}" if len(rows) > limit else ""
+        return ("❗ Не удалось отправить:\n" + "\n".join(rows[:limit]) + more)[:3900]
 
     # ───────── членство в группах (без ResolveUsername и без вступления) ─────────
 
@@ -586,16 +830,18 @@ class Bot:
             await event.respond("▶️ Посты продолжены.")
         elif cmd == "/groups":
             await event.respond(self.groups_text())
+        elif cmd == "/fails":
+            await event.respond(self.undelivered_text(limit=20))
         elif cmd == "/open":
             n = 0
             for g in self.state["groups"].values():
                 if g.get("off"):
-                    g["off"] = {}
+                    g["off"], g["off_at"], g["off_n"] = {}, {}, {}
                     n += 1
             self.touch()
             await event.respond(f"Снято отключение с групп: {n}")
         elif cmd in ("/help", "/start"):
-            await event.respond("/status — отчёт сейчас\n/groups — список групп\n/pause, /resume — пауза постов\n/open — вернуть отключённые группы")
+            await event.respond("/status — отчёт сейчас\n/groups — список групп\n/fails — что не отправилось и почему\n/pause, /resume — пауза постов\n/open — вернуть отключённые группы")
 
     # ───────── отчёты ─────────
 
@@ -636,6 +882,9 @@ class Bot:
         lines.append(f"Сегодня всего: {sum(sent_today.values())} (лимит {self.cfg.daily_limit}/акк)")
         lines.append(f"Охвачено групп за 24 ч: {reached} из {len(usable)} доступных (всего в списке {len(self.groups)})")
         lines.append(f"Автоответов в лс: {dms}")
+        checked = sum(1 for e in ok if e.get("detail") == "проверено")
+        gone = sum(1 for e in evs if e["kind"] == "post_deleted")
+        lines.append(f"Проверено, что пост на месте: {checked} из {len(ok) + gone}" + (f" · удалено в группах: {gone}" if gone else ""))
         if errs:
             kinds: dict = {}
             for e in errs:
@@ -653,6 +902,9 @@ class Bot:
                 lines.append(f"⏸ Акк.{acc} на паузе до {pu.astimezone(self.tz).strftime('%d.%m %H:%M')}")
         if self.state.get("paused"):
             lines.append("⏸ Все посты на паузе (/resume)")
+        bad = self.undelivered_text(limit=6)
+        if not bad.startswith("✅"):
+            lines.append(bad)
         nxt = [parse_iso(self.acc_state(a).get("next_at")) for a in self.clients if a not in self.dead]
         nxt = [t for t in nxt if t]
         if nxt and not self.state.get("paused"):
@@ -685,6 +937,10 @@ class Bot:
     async def report_loop(self):
         while not self.stop:
             await asyncio.sleep(60)
+            try:
+                await self.process_pending()
+            except Exception as e:  # noqa: BLE001
+                log.warning("перепроверка постов: %s", e)
             if self.alerts:
                 text, self.alerts = "\n".join(self.alerts), []
                 await self.send_report(text)
