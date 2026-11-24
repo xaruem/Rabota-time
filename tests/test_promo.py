@@ -12,20 +12,51 @@ TZ = ZoneInfo("Europe/Moscow")
 TEXTS = json.loads((Path(__file__).resolve().parent.parent / "texts.json").read_text(encoding="utf-8"))
 
 
+class FakeMsg:
+    def __init__(self, id, text, date):
+        self.id, self.message, self.out, self.date = id, text, True, date
+
+
 class FakeClient:
-    def __init__(self, fail=None):
-        self.sent, self.fail = [], fail
+    """fail — исключение (или список исключений по очереди); lost — «сообщение сразу удалили»."""
+    def __init__(self, fail=None, lost=False):
+        self.sent, self.fail, self.lost, self.store, self.n = [], fail, lost, {}, 0
+        self.connected = True
+
+    def is_connected(self):
+        return self.connected
+
+    async def connect(self):
+        self.connected = True
 
     async def send_message(self, chat, text, **kw):
-        if self.fail:
-            raise self.fail
+        f = self.fail.pop(0) if isinstance(self.fail, list) and self.fail else (None if isinstance(self.fail, list) else self.fail)
+        if f:
+            raise f
+        self.n += 1
         self.sent.append((chat, text))
+        m = FakeMsg(self.n, text, datetime.now(TZ))
+        if not self.lost:
+            self.store[(chat, m.id)] = m
+        return m
+
+    async def get_messages(self, chat, ids=None):
+        return self.store.get((chat, ids))
+
+    async def iter_messages(self, chat, limit=10):
+        for (c, _i), m in list(self.store.items()):
+            if c == chat:
+                yield m
 
 
-def make_bot(n_groups=40, accs=(1, 2, 3), fail=None, tmp=None, **cfg):
+def make_bot(n_groups=40, accs=(1, 2, 3), fail=None, tmp=None, lost=False, **cfg):
     groups = [P.parse_group_ref(f"@group_{i:03d}") for i in range(n_groups)]
-    clients = {a: FakeClient(fail) for a in accs}
+    clients = {a: FakeClient(fail, lost) for a in accs}
     bot = P.Bot(P.Cfg(state_path=str(tmp or "/tmp/_st.json"), **cfg), TEXTS, groups, clients, rng=random.Random(7))
+
+    async def no_sleep(_s):
+        return None
+    bot.sleep = no_sleep
     bot.members = {g.key: set(accs) for g in groups}
     bot.chat_ids = {a: {g.key: i for i, g in enumerate(groups)} for a in accs}
     return bot
@@ -252,3 +283,99 @@ def test_status_counts_only_listed_groups(tmp_path):
     bot = make_bot(tmp=tmp_path / "s.json")
     bot.state["groups"]["@old_removed"] = {"last_post": P.iso(bot.now())}
     assert "Охвачено групп за 24 ч: 0 из 40" in bot.report_text(None)
+
+
+# ───────────── надёжность: проверка поста, повторы, причины сбоев ─────────────
+
+def test_explain_error_has_reason_and_fix():
+    for exc, kind in [(E.ChatWriteForbiddenError(request=None), "group_off"),
+                      (E.PeerFloodError(request=None), "peerflood"),
+                      (E.AuthKeyDuplicatedError(request=None), "dead"),
+                      (ConnectionError("x"), "transient"),
+                      (asyncio.TimeoutError(), "transient"),
+                      (RuntimeError("boom"), "unknown")]:
+        k, reason, fix = P.explain_error(exc)
+        assert k == kind and reason and fix
+
+
+def test_post_is_verified(tmp_path):
+    bot = make_bot(accs=(1,), tmp=tmp_path / "s.json")
+    asyncio.run(bot.send_one(1, "@group_000"))
+    ev = posts(bot)
+    assert len(ev) == 1 and ev[0]["detail"] == "проверено"
+    assert bot.pending and bot.pending[0]["key"] == "@group_000"
+    assert "Проверено, что пост на месте: 1 из 1" in bot.report_text(None)
+
+
+def test_deleted_post_is_reported_with_reason(tmp_path):
+    bot = make_bot(accs=(1,), lost=True, tmp=tmp_path / "s.json")
+    asyncio.run(bot.send_one(1, "@group_000"))
+    assert not posts(bot)
+    assert any(e["kind"] == "post_deleted" for e in bot.state["events"])
+    assert bot.alerts and "удалил админ" in bot.alerts[0] and "Что делать" in bot.alerts[0]
+    assert "@group_000" in bot.undelivered_text()
+
+
+def test_late_check_catches_deletion(tmp_path):
+    bot = make_bot(accs=(1,), tmp=tmp_path / "s.json")
+    asyncio.run(bot.send_one(1, "@group_000"))
+    bot.clients[1].store.clear()                       # модератор удалил пост позже
+    bot._now = lambda: datetime.now(TZ) + timedelta(minutes=20)
+    asyncio.run(bot.process_pending())
+    assert any(e["kind"] == "post_deleted" for e in bot.state["events"])
+
+
+def test_transient_error_is_retried_without_disabling_group(tmp_path):
+    bot = make_bot(accs=(1,), fail=[ConnectionError("net"), ConnectionError("net")], tmp=tmp_path / "s.json")
+    asyncio.run(bot.send_one(1, "@group_000"))
+    assert len(posts(bot)) == 1 and len(bot.clients[1].sent) == 1     # дошло с 3-й попытки, без дублей
+    bot2 = make_bot(accs=(1,), fail=ConnectionError("net"), tmp=tmp_path / "s2.json")
+    for _ in range(4):
+        asyncio.run(bot2.send_one(1, "@group_000"))
+    assert not bot2.state["groups"]["@group_000"].get("off")          # сеть — не повод отключать группу
+    assert any(e["kind"] == "post_fail" for e in bot2.state["events"])
+
+
+def test_no_duplicate_when_send_succeeded_but_connection_dropped(tmp_path):
+    bot = make_bot(accs=(1,), tmp=tmp_path / "s.json")
+    cl = bot.clients[1]
+    real = cl.send_message
+    calls = {"n": 0}
+
+    async def flaky(chat, text, **kw):
+        calls["n"] += 1
+        m = await real(chat, text, **kw)          # сообщение ушло...
+        if calls["n"] == 1:
+            raise ConnectionError("обрыв после отправки")   # ...но ответ мы не получили
+        return m
+    cl.send_message = flaky
+    asyncio.run(bot.send_one(1, "@group_000"))
+    assert len(cl.sent) == 1 and len(posts(bot)) == 1
+
+
+def test_group_off_reason_in_alert_and_auto_reopen(tmp_path):
+    bot = make_bot(accs=(1,), fail=E.ChatWriteForbiddenError(request=None), tmp=tmp_path / "s.json")
+    asyncio.run(bot.send_one(1, "@group_000"))
+    g = bot.state["groups"]["@group_000"]
+    assert "1" in g["off"] and "Что делать" in bot.alerts[0]
+    assert "@group_000" in bot.undelivered_text() and "нельзя писать" in bot.undelivered_text()
+    t0 = bot.now()
+    bot.reopen_due(t0 + timedelta(hours=11))
+    assert "1" in g["off"]                                            # рано
+    bot.reopen_due(t0 + timedelta(hours=13))
+    assert "1" not in g["off"]                                        # перепроверка через 12 ч
+
+
+def test_missing_chat_does_not_crash(tmp_path):
+    bot = make_bot(accs=(1,), tmp=tmp_path / "s.json")
+    bot.chat_ids[1].pop("@group_000")
+    asyncio.run(bot.send_one(1, "@group_000"))                        # раньше: KeyError → падение цикла
+    assert "1" in bot.state["groups"]["@group_000"]["off"]
+    assert "не нашёл" in bot.undelivered_text()
+
+
+def test_alerts_are_not_repeated(tmp_path):
+    bot = make_bot(accs=(1,), lost=True, tmp=tmp_path / "s.json")
+    for _ in range(3):
+        bot.event("group_off", 1, "@group_000", "x", "y")
+    assert len(bot.alerts) == 1
